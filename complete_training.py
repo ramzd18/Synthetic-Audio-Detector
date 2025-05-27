@@ -51,12 +51,12 @@ class PositionalEncoding(nn.Module):
         
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0)
         
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return x + self.pe[:x.size(0), :].transpose(0, 1)
+        return x + self.pe[:, :x.size(1)]
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=1):
@@ -280,7 +280,7 @@ class EnhancedRawNet2(PreTrainedModel):
         return outputs
 
 class AudioDataset(Dataset):
-    def __init__(self, data_dir, max_length=64000, sample_rate=16000):
+    def __init__(self, data_dir, max_length=400000, sample_rate=16000):
         self.data_dir = Path(data_dir)
         self.max_length = max_length
         self.sample_rate = sample_rate
@@ -348,7 +348,7 @@ def load_vocoders():
     try:
         # 1. HiFi-GAN (from hifigan_vocoder)
         logger.info("Loading HiFi-GAN...")
-        hifigan_model = hifigan(dataset='uni', device=device)
+        hifigan_model = hifigan(dataset='uni', device='cpu')
         vocoders['hifigan'] = {
             'model': hifigan_model,
             'type': 'hifigan'
@@ -356,33 +356,33 @@ def load_vocoders():
     except Exception as e:
         logger.warning(f"Failed to load HiFi-GAN: {e}")
     
-    try:
-        # 2. Tacotron2 with Griffin-Lim
-        logger.info("Loading Tacotron2 with Griffin-Lim...")
-        bundle = torchaudio.pipelines.TACOTRON2_WAVERNN_CHAR_LJSPEECH
-        processor = bundle.get_text_processor()
-        tacotron2 = bundle.get_tacotron2().to(device)
-        vocoder = bundle.get_vocoder().to(device)
+    # try:
+    #     # 2. Tacotron2 with Griffin-Lim
+    #     logger.info("Loading Tacotron2 with Griffin-Lim...")
+    #     bundle = torchaudio.pipelines.TACOTRON2_WAVERNN_CHAR_LJSPEECH
+    #     processor = bundle.get_text_processor()
+    #     tacotron2 = bundle.get_tacotron2().to(device)
+    #     vocoder = bundle.get_vocoder()
         
-        vocoders['tacotron2_griffinlim'] = {
-            'model': vocoder,
-            'processor': processor,
-            'tacotron2': tacotron2,
-            'type': 'tacotron2_griffinlim'
-        }
-    except Exception as e:
-        logger.warning(f"Failed to load Tacotron2 with Griffin-Lim: {e}")
+    #     vocoders['tacotron2_griffinlim'] = {
+    #         'model': vocoder,
+    #         'processor': processor,
+    #         'tacotron2': tacotron2,
+    #         'type': 'tacotron2_griffinlim'
+    #     }
+    # except Exception as e:
+    #     logger.warning(f"Failed to load Tacotron2 with Griffin-Lim: {e}")
     
-    try:
-        # 3. WorldVocoder
-        logger.info("Loading WorldVocoder...")
-        vocoder = wv.World()
-        vocoders['worldvocoder'] = {
-            'model': vocoder,
-            'type': 'worldvocoder'
-        }
-    except Exception as e:
-        logger.warning(f"Failed to load WorldVocoder: {e}")
+    # try:
+    #     # 3. WorldVocoder
+    #     logger.info("Loading WorldVocoder...")
+    #     vocoder = wv.World()
+    #     vocoders['worldvocoder'] = {
+    #         'model': vocoder,
+    #         'type': 'worldvocoder'
+    #     }
+    # except Exception as e:
+    #     logger.warning(f"Failed to load WorldVocoder: {e}")
     
     try:
         # 4. Vocos
@@ -398,7 +398,7 @@ def load_vocoders():
     try:
         # 5. SpeechBrain's HiFi-GAN
         logger.info("Loading SpeechBrain's HiFi-GAN...")
-        hifi_gan = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-ljspeech").to(device)
+        hifi_gan = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-ljspeech")
         vocoders['speechbrain_hifigan'] = {
             'model': hifi_gan,
             'type': 'speechbrain_hifigan'
@@ -429,7 +429,7 @@ def create_synthetic_data(real_audio_dir, synthetic_audio_dir, dataset_name="com
         logger.info(f"Loading {dataset_name} dataset...")
         if dataset_name == "common_voice":
             dataset = load_dataset("mozilla-foundation/common_voice_13_0", language, split="train", streaming=True)
-            dataset = dataset.take(num_samples)
+            # dataset = dataset.take(num_samples)
         elif dataset_name == "librispeech":
             dataset = load_dataset("librispeech_asr", "clean", split="train.100", streaming=True)
             dataset = dataset.take(num_samples)
@@ -557,10 +557,10 @@ def audio_to_mel(audio_array, sample_rate, n_mels=80, n_fft=1024, hop_length=256
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Ensure audio is a torch tensor, shape (1, N)
-    if not isinstance(audio_array, torch.Tensor):
-        audio_tensor = torch.tensor(audio_array, dtype=torch.float32, device=device)
-    else:
-        audio_tensor = audio_array.float().to(device)
+    # if not isinstance(audio_array, torch.Tensor):
+    audio_tensor = torch.tensor(audio_array, dtype=torch.float32, device=device)
+    # else:
+    #     audio_tensor = audio_array.float().to(device)
     
     if audio_tensor.ndim == 1:
         audio_tensor = audio_tensor.unsqueeze(0)
@@ -588,23 +588,31 @@ def generate_with_hifigan(audio_array, sample_rate, models):
     """Generate synthetic audio using HiFi-GAN"""
     try:
         model = models['model']
+        device = "cuda"
+
         if isinstance(audio_array, np.ndarray):
-            audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+            audio_tensor = torch.from_numpy(audio_array).float().to(device)
         else:
-            audio_tensor = audio_array.float()
+            # Use clone().detach() for existing tensors
+            audio_tensor = audio_array.clone().detach().float().to(device)
         
         # Ensure tensor is on the same device as the model
         device = "cuda"
         audio_tensor = audio_tensor.to(device)
-            
+        print("BEFORE AUDIO TO MEL")
         mel = audio_to_mel(audio_tensor, sample_rate)  # (1, 80, T)
-        
-        # Make sure mel spectrogram is on correct device
+        print("AFTER AUDIO TO MEL")
+
         if isinstance(mel, torch.Tensor):
-            mel = mel.to(device)
-        
+            print("ALTERED")
+            mel = mel.squeeze().detach().cpu().numpy()
+        else:
+            mel = np.array(mel).squeeze()
         with torch.no_grad():
+            print("BEFORE INFERENCE")
+            print(type(mel))
             audio = model.infer(mel)
+            print("AFTER INFERENCE")
             # Always move to CPU before converting to numpy
             if isinstance(audio, torch.Tensor):
                 audio = audio.squeeze().detach().cpu().numpy()
@@ -626,9 +634,12 @@ def generate_with_tacotron2_griffinlim(audio_array, sample_rate, models):
         else:
             audio_tensor = audio_array.float()
         mel_from_audio = audio_to_mel(audio_tensor, sample_rate)
+        mel_from_audio = mel_from_audio.to("cpu")
         with torch.no_grad():
             # Use vocoder.generate() instead of infer()
+            print("Generate")
             audio = vocoder.forward(mel_from_audio)
+            print("AFTER GENERATE")
             if isinstance(audio, torch.Tensor):
                 audio = audio.squeeze().detach().cpu().numpy()
             else:
@@ -708,7 +719,7 @@ def generate_with_speechbrain_hifigan(audio_array, sample_rate, models):
             audio_tensor = audio_array.float()
             
         mel = audio_to_mel(audio_tensor, sample_rate)  # (1, 80, T)
-        
+        mel=mel.to("cuda")
         with torch.no_grad():
             # SpeechBrain HiFi-GAN expects mel spectrograms
             waveforms = model.decode_batch(mel)
@@ -830,8 +841,8 @@ def train_model(model, train_loader, val_loader, num_epochs=50, learning_rate=1e
         {'params': model.multi_scale_cnn.parameters(), 'lr': learning_rate},
         {'params': model.cnn_layers.parameters(), 'lr': learning_rate},
         {'params': model.residual_blocks.parameters(), 'lr': learning_rate},
-        {'params': model.transformer.parameters(), 'lr': learning_rate * 0.5},  # Lower LR for transformer
-        {'params': model.classifier.parameters(), 'lr': learning_rate * 2}  # Higher LR for classifier
+        {'params': model.transformer.parameters(), 'lr': learning_rate * 0.5},  
+        {'params': model.classifier.parameters(), 'lr': learning_rate * 2}  
     ], weight_decay=0.01)
     
     # Learning rate scheduler
@@ -956,7 +967,7 @@ def main():
     )
     print("CREATING CONFIG")
     
-    # Data directories
+    # # Data directories
     data_dir = "./audio_data"
     real_audio_dir = os.path.join(data_dir, "real")
     synthetic_audio_dir = os.path.join(data_dir, "synthetic")
@@ -974,7 +985,6 @@ def main():
         synthetic_audio_dir, 
         dataset_name="common_voice",  # Options: "common_voice", "librispeech", "vctk"
         language="en", 
-        num_samples=2000  
     )
     print("SYNTHETIC DATA CREATED")
     
@@ -998,11 +1008,16 @@ def main():
     
     print("TRAINING MODEL")
     # Train model
-    trained_model = train_model(model, train_loader, val_loader, num_epochs=50)
+    trained_model = train_model(model, train_loader, val_loader, num_epochs=2)
     print("MODEL TRAINED")
     
+    os.makedirs("model", exist_ok=True)
+    
+    torch.save(trained_model.state_dict(), "model/enhanced_rawnet2.pt")
+    print("MODEL SAVED LOCALLY")
+    
     # Save to HuggingFace
-    save_to_huggingface(trained_model, repo_name="your-username/enhanced-rawnet2-antispoofing")
+    # save_to_huggingface(trained_model, repo_name="your-username/enhanced-rawnet2-antispoofing")
     
     logger.info("Training completed!")
 
