@@ -16,7 +16,17 @@ from transformers import PreTrainedModel, PretrainedConfig
 from huggingface_hub import HfApi, Repository
 import math
 from scipy import signal
-
+from hifigan_vocoder import hifigan, get_sample_mel
+from waveglow_vocoder import WaveGlowVocoder
+from vocos import Vocos
+from speechbrain.inference.vocoders import HIFIGAN
+from datasets import load_dataset
+from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
+import soundfile as sf
+import librosa
+from scipy.io import wavfile
+from huggingface_hub import login
+import worldvocoder as wv
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -130,7 +140,7 @@ class AttentionPooling(nn.Module):
         return pooled
 
 class EnhancedRawNet2Config(PretrainedConfig):
-    model_type = "enhanced_rawnet2"
+    # model_type = "enhanced_rawnet2"
     
     def __init__(
         self,
@@ -160,7 +170,6 @@ class EnhancedRawNet2(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         
-        # Multi-scale CNN frontend (replacing SincNet)
         self.multi_scale_cnn = MultiScaleCNN(input_channels=1, output_channels=config.cnn_channels)
         
         # Additional CNN layers for feature extraction
@@ -176,7 +185,6 @@ class EnhancedRawNet2(PreTrainedModel):
             nn.Dropout(config.dropout),
         )
         
-        # Residual blocks
         self.residual_blocks = nn.ModuleList([
             ResidualBlock(config.cnn_channels, dilation=2**i) 
             for i in range(config.num_residual_blocks)
@@ -337,12 +345,6 @@ def create_synthetic_data(real_audio_dir, synthetic_audio_dir, dataset_name="com
     Create synthetic data by loading real audio from HuggingFace datasets,
     processing half through neural vocoders, and organizing into directories.
     """
-    from datasets import load_dataset
-    from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
-    import soundfile as sf
-    import librosa
-    from scipy.io import wavfile
-    
     logger.info(f"Creating synthetic data from {dataset_name} dataset")
     
     # Create directories
@@ -447,90 +449,69 @@ def create_synthetic_data(real_audio_dir, synthetic_audio_dir, dataset_name="com
         raise
 
 def load_vocoders():
-    """Load six diverse neural vocoders from HuggingFace"""
+    """Load five specific neural vocoders"""
     vocoders = {}
     
     try:
-        # 1. SpeechT5 + HiFi-GAN (Microsoft TTS with high-quality vocoder)
-        logger.info("Loading SpeechT5 + HiFi-GAN...")
-        processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
-        model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts")
-        vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
+        # 1. HiFi-GAN (from hifigan_vocoder)
+        logger.info("Loading HiFi-GAN...")
+        hifigan_model = hifigan(dataset='uni', device='cpu')
+        vocoders['hifigan'] = {
+            'model': hifigan_model,
+            'type': 'hifigan'
+        }
+    except Exception as e:
+        logger.warning(f"Failed to load HiFi-GAN: {e}")
+    
+    try:
+        # 2. Tacotron2 with Griffin-Lim
+        logger.info("Loading Tacotron2 with Griffin-Lim...")
+        bundle = torchaudio.pipelines.TACOTRON2_WAVERNN_CHAR_LJSPEECH
+        processor = bundle.get_text_processor()
+        tacotron2 = bundle.get_tacotron2()
+        vocoder = bundle.get_vocoder()
         
-        vocoders['speecht5_hifigan'] = {
+        vocoders['tacotron2_griffinlim'] = {
+            'model': vocoder,
             'processor': processor,
-            'model': model,
-            'vocoder': vocoder,
-            'type': 'tts'
+            'tacotron2': tacotron2,
+            'type': 'tacotron2_griffinlim'
         }
     except Exception as e:
-        logger.warning(f"Failed to load SpeechT5 HiFi-GAN: {e}")
+        logger.warning(f"Failed to load Tacotron2 with Griffin-Lim: {e}")
     
     try:
-        # 2. Bark (Suno's realistic speech synthesis)
-        from transformers import BarkModel, BarkProcessor
-        logger.info("Loading Bark vocoder...")
-        bark_processor = BarkProcessor.from_pretrained("suno/bark-small")
-        bark_model = BarkModel.from_pretrained("suno/bark-small")
-        
-        vocoders['bark'] = {
-            'processor': bark_processor,
-            'model': bark_model,
-            'type': 'bark'
+        # 3. WorldVocoder
+        logger.info("Loading WorldVocoder...")
+        vocoder = wv.World()
+        vocoders['worldvocoder'] = {
+            'model': vocoder,
+            'type': 'worldvocoder'
         }
     except Exception as e:
-        logger.warning(f"Failed to load Bark: {e}")
+        logger.warning(f"Failed to load WorldVocoder: {e}")
     
     try:
-        # 3. VITS (End-to-end TTS with adversarial training)
-        from transformers import VitsModel, VitsTokenizer
-        logger.info("Loading VITS...")
-        vits_model = VitsModel.from_pretrained("facebook/mms-tts-eng")
-        vits_tokenizer = VitsTokenizer.from_pretrained("facebook/mms-tts-eng")
-        
-        vocoders['vits'] = {
-            'model': vits_model,
-            'tokenizer': vits_tokenizer,
-            'type': 'vits'
+        # 4. Vocos
+        logger.info("Loading Vocos...")
+        vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz")
+        vocoders['vocos'] = {
+            'model': vocos,
+            'type': 'vocos'
         }
     except Exception as e:
-        logger.warning(f"Failed to load VITS: {e}")
+        logger.warning(f"Failed to load Vocos: {e}")
     
     try:
-        # 4. MusicGen (Meta's audio generation)
-        from transformers import MusicgenForConditionalGeneration, AutoProcessor
-        logger.info("Loading MusicGen...")
-        musicgen_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-        musicgen_model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
-        
-        vocoders['musicgen'] = {
-            'processor': musicgen_processor,
-            'model': musicgen_model,
-            'type': 'musicgen'
+        # 5. SpeechBrain's HiFi-GAN
+        logger.info("Loading SpeechBrain's HiFi-GAN...")
+        hifi_gan = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-ljspeech")
+        vocoders['speechbrain_hifigan'] = {
+            'model': hifi_gan,
+            'type': 'speechbrain_hifigan'
         }
     except Exception as e:
-        logger.warning(f"Failed to load MusicGen: {e}")
-    
-    try:
-        # 5. Tortoise TTS (High-quality but slower TTS)
-        logger.info("Loading Tortoise TTS...")
-        # Note: Tortoise might not be directly available via transformers
-        # We'll simulate its artifacts for now
-        vocoders['tortoise'] = {
-            'type': 'tortoise_sim'
-        }
-    except Exception as e:
-        logger.warning(f"Failed to load Tortoise TTS: {e}")
-    
-    try:
-        # 6. Tacotron2 + WaveGlow (NVIDIA's TTS pipeline)
-        logger.info("Loading Tacotron2 simulation...")
-        # Tacotron2 might not be directly available, so we'll simulate
-        vocoders['tacotron2'] = {
-            'type': 'tacotron2_sim'
-        }
-    except Exception as e:
-        logger.warning(f"Failed to load Tacotron2: {e}")
+        logger.warning(f"Failed to load SpeechBrain's HiFi-GAN: {e}")
     
     if not vocoders:
         logger.error("No vocoders could be loaded!")
@@ -543,213 +524,264 @@ def generate_synthetic_audio(audio_array, sample_rate, vocoder_models, vocoder_n
     """Generate synthetic audio using the specified vocoder"""
     
     try:
-        if vocoder_name == 'speecht5_hifigan':
-            return generate_with_speecht5(audio_array, sample_rate, vocoder_models)
-        elif vocoder_name == 'bark':
-            return generate_with_bark(audio_array, sample_rate, vocoder_models)
-        elif vocoder_name == 'vits':
-            return generate_with_vits(audio_array, sample_rate, vocoder_models)
-        elif vocoder_name == 'musicgen':
-            return generate_with_musicgen(audio_array, sample_rate, vocoder_models)
-        elif vocoder_name == 'tortoise':
-            return generate_with_tortoise(audio_array, sample_rate, vocoder_models)
-        elif vocoder_name == 'tacotron2':
-            return generate_with_tacotron2(audio_array, sample_rate, vocoder_models)
+        if vocoder_name == 'hifigan':
+            return generate_with_hifigan(audio_array, sample_rate, vocoder_models)
+        elif vocoder_name == 'tacotron2_griffinlim':
+            return generate_with_tacotron2_griffinlim(audio_array, sample_rate, vocoder_models)
+        elif vocoder_name == 'worldvocoder':
+            return generate_with_worldvocoder(audio_array, sample_rate, vocoder_models)
+        elif vocoder_name == 'vocos':
+            return generate_with_vocos(audio_array, sample_rate, vocoder_models)
+        elif vocoder_name == 'speechbrain_hifigan':
+            return generate_with_speechbrain_hifigan(audio_array, sample_rate, vocoder_models)
         else:
             logger.warning(f"Unknown vocoder type: {vocoder_name}")
-            return None
+            return add_vocoder_artifacts(audio_array, vocoder_name)
             
     except Exception as e:
         logger.warning(f"Error generating with {vocoder_name}: {e}")
-        return None
+        return add_vocoder_artifacts(audio_array, vocoder_name)
 
-def generate_with_speecht5(audio_array, sample_rate, models):
-    """Generate synthetic audio using SpeechT5 + HiFi-GAN"""
+def audio_to_mel(audio_array, sample_rate, n_mels=80, n_fft=1024, hop_length=256):
+    """
+    Convert a numpy audio array to a mel-spectrogram tensor.
+    """
+    # Ensure audio is a torch tensor, shape (1, N)
+    if not isinstance(audio_array, torch.Tensor):
+        audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+    else:
+        audio_tensor = audio_array.float()
+    if audio_tensor.ndim == 1:
+        audio_tensor = audio_tensor.unsqueeze(0)
+    # Normalize if needed
+    if audio_tensor.abs().max() > 1.0:
+        audio_tensor = audio_tensor / audio_tensor.abs().max()
+    mel_transform = torchaudio.transforms.MelSpectrogram(
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        center=True,
+        power=1.0,
+        norm="slaney",
+        mel_scale="htk"
+    )
+    mel = mel_transform(audio_tensor)
+    # (1, n_mels, T)
+    return mel
+
+def generate_with_hifigan(audio_array, sample_rate, models):
+    """Generate synthetic audio using HiFi-GAN"""
     try:
-        processor = models['processor']
         model = models['model']
-        vocoder = models['vocoder']
-        
-        # Convert audio to mel-spectrogram
-        inputs = processor(audio=audio_array, sampling_rate=sample_rate, return_tensors="pt")
-        
-        # Generate mel-spectrogram (this is a simplified approach)
-        # In practice, you might want to use speech recognition to get text first
+        if isinstance(audio_array, np.ndarray):
+            audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+        else:
+            audio_tensor = audio_array.float()
+            
+        mel = audio_to_mel(audio_tensor, sample_rate)  # (1, 80, T)
         with torch.no_grad():
-            # For demonstration, we'll create a simple mel-spectrogram from the audio
-            mel_spec = torch.randn(1, 80, 100)  # Dummy mel-spectrogram
-            
-            # Use vocoder to generate audio
-            waveform = vocoder(mel_spec)
-            
-        return waveform.squeeze().cpu().numpy()
-        
+            audio = model.infer(mel)
+            if isinstance(audio, torch.Tensor):
+                audio = audio.squeeze().detach().cpu().numpy()
+            else:
+                audio = np.array(audio).squeeze()
+        return audio.astype(np.float32)
     except Exception as e:
-        logger.warning(f"SpeechT5 generation failed: {e}")
-        # Fallback: add vocoder-like artifacts to original audio
+        logger.warning(f"HiFi-GAN generation failed: {e}")
         return add_vocoder_artifacts(audio_array, 'hifigan')
-
-def generate_with_bark(audio_array, sample_rate, models):
-    """Generate synthetic audio using Bark"""
+def generate_with_tacotron2_griffinlim(audio_array, sample_rate, models):
+    """Generate synthetic audio using Tacotron2 with Griffin-Lim"""
     try:
-        processor = models['processor']
+        vocoder = models['model']
+        # print("TACOTRON2", dir(vocoder))
+
+        if isinstance(audio_array, np.ndarray):
+            audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+        else:
+            audio_tensor = audio_array.float()
+        mel_from_audio = audio_to_mel(audio_tensor, sample_rate)
+        with torch.no_grad():
+            # Use vocoder.generate() instead of infer()
+            audio = vocoder.forward(mel_from_audio)
+            if isinstance(audio, torch.Tensor):
+                audio = audio.squeeze().detach().cpu().numpy()
+            else:
+                audio = np.array(audio).squeeze()
+            
+            # Handle inhomogeneous array shape by ensuring consistent dimensions
+            if isinstance(audio, np.ndarray) and len(audio.shape) > 1:
+                # Take first channel if multi-channel
+                audio = audio[0] if audio.shape[0] <= 2 else audio.mean(axis=0)
+            
+        return audio.astype(np.float32)
+    except Exception as e:
+        logger.warning(f"Tacotron2 with Griffin-Lim generation failed: {e}")
+        return add_vocoder_artifacts(audio_array, 'tacotron2_griffinlim')
+
+def generate_with_worldvocoder(audio_array, sample_rate, models):
+    """Generate synthetic audio using WorldVocoder"""
+    try:
+        vocoder = models['model']
+        
+        # Convert to numpy array if needed
+        if isinstance(audio_array, torch.Tensor):
+            audio_array = audio_array.detach().cpu().numpy()
+        
+        # Ensure sample_rate is a Python int, not np.int
+        sample_rate = int(sample_rate)
+        
+        # Encode audio using World vocoder
+        dat = vocoder.encode(sample_rate, audio_array, f0_method='harvest')        
+        dat = vocoder.decode(dat)
+        audio = dat["out"]
+        
+        return audio.astype(np.float32)
+    except Exception as e:
+        logger.warning(f"WorldVocoder generation failed: {e}")
+        return add_vocoder_artifacts(audio_array, 'worldvocoder')
+
+def generate_with_vocos(audio_array, sample_rate, models):
+    """Generate synthetic audio using Vocos"""
+    try:
         model = models['model']
-        
-        # Convert audio to text (simplified - you might want to use ASR)
-        # For demo purposes, we'll use a generic prompt
-        text_prompt = "Hello, this is a test of synthetic speech generation."
-        
-        inputs = processor(text_prompt, return_tensors="pt")
+        # Convert to tensor if needed
+        if isinstance(audio_array, np.ndarray):
+            audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+        else:
+            audio_tensor = audio_array.float()
+            
+        mel = audio_to_mel(audio_tensor, sample_rate, n_mels=100)  # (1, 80, T)
+        print("MEL SHAPE", mel.shape)
+        device = next(model.parameters()).device
+        mel = mel.to(device)
         
         with torch.no_grad():
-            audio_array_generated = model.generate(**inputs, do_sample=True, fine_temperature=0.4, coarse_temperature=0.8)
-            audio_array_generated = audio_array_generated.cpu().numpy().squeeze()
-            
-        # Resample if needed
-        if len(audio_array_generated.shape) > 1:
-            audio_array_generated = audio_array_generated[0]
-            
-        return audio_array_generated
+            # Vocos expects mel in format (batch, n_mels, time)
+            audio = model.decode(mel)
+            if isinstance(audio, torch.Tensor):
+                audio = audio.squeeze().detach().cpu().numpy()
+            else:
+                audio = np.array(audio).squeeze()
         
+        # Ensure audio is in valid range
+        audio = np.clip(audio, -1.0, 1.0)
+        return audio.astype(np.float32)
     except Exception as e:
-        logger.warning(f"Bark generation failed: {e}")
-        return add_vocoder_artifacts(audio_array, 'bark')
+        logger.warning(f"Vocos generation failed: {e}")
+        return add_vocoder_artifacts(audio_array, 'vocos')
 
-def generate_with_vits(audio_array, sample_rate, models):
-    """Generate synthetic audio using VITS"""
+def generate_with_speechbrain_hifigan(audio_array, sample_rate, models):
+    """Generate synthetic audio using SpeechBrain's HiFi-GAN"""
     try:
         model = models['model']
-        tokenizer = models['tokenizer']
         
-        # Convert audio to text (simplified approach)
-        # In practice, you'd use ASR for better text extraction
-        text_prompt = "This is a synthetic speech sample generated using VITS model."
-        
-        inputs = tokenizer(text_prompt, return_tensors="pt")
+        # Convert to tensor if needed
+        if isinstance(audio_array, np.ndarray):
+            audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+        else:
+            audio_tensor = audio_array.float()
+            
+        mel = audio_to_mel(audio_tensor, sample_rate)  # (1, 80, T)
         
         with torch.no_grad():
-            audio_array_generated = model(**inputs).waveform
-            audio_array_generated = audio_array_generated.squeeze().cpu().numpy()
-            
-        # Ensure proper length and format
-        if len(audio_array_generated.shape) > 1:
-            audio_array_generated = audio_array_generated[0]
-            
-        return audio_array_generated
+            # SpeechBrain HiFi-GAN expects mel spectrograms
+            waveforms = model.decode_batch(mel)
+            if isinstance(waveforms, (list, tuple)):
+                audio = waveforms[0].squeeze().detach().cpu().numpy()
+            else:
+                audio = waveforms.squeeze().detach().cpu().numpy()
         
+        # Ensure audio is in valid range and format
+        audio = np.clip(audio, -1.0, 1.0)
+        audio = audio.astype(np.float32)
+        
+        return audio
     except Exception as e:
-        logger.warning(f"VITS generation failed: {e}")
-        return add_vocoder_artifacts(audio_array, 'vits')
-
-def generate_with_tortoise(audio_array, sample_rate, models):
-    """Generate synthetic audio using Tortoise TTS simulation"""
-    try:
-        # Since Tortoise TTS might not be directly available via transformers,
-        # we'll create realistic Tortoise-like artifacts
-        return add_vocoder_artifacts(audio_array, 'tortoise')
-        
-    except Exception as e:
-        logger.warning(f"Tortoise generation failed: {e}")
-        return add_vocoder_artifacts(audio_array, 'tortoise')
-
-def generate_with_tacotron2(audio_array, sample_rate, models):
-    """Generate synthetic audio using Tacotron2 simulation"""
-    try:
-        # Since Tacotron2 might not be directly available via transformers,
-        # we'll create realistic Tacotron2-like artifacts
-        return add_vocoder_artifacts(audio_array, 'tacotron2')
-        
-    except Exception as e:
-        logger.warning(f"Tacotron2 generation failed: {e}")
-        return add_vocoder_artifacts(audio_array, 'tacotron2')
-
-def generate_with_musicgen(audio_array, sample_rate, models):
-    """Generate synthetic audio using MusicGen"""
-    try:
-        processor = models['processor']
-        model = models['model']
-        
-        # Use a generic prompt for audio generation
-        inputs = processor(
-            text=["speech recording"],
-            padding=True,
-            return_tensors="pt"
-        )
-        
-        with torch.no_grad():
-            audio_values = model.generate(**inputs, max_new_tokens=256)
-            audio_array_generated = audio_values[0, 0].cpu().numpy()
-            
-        return audio_array_generated
-        
-    except Exception as e:
-        logger.warning(f"MusicGen generation failed: {e}")
-        return add_vocoder_artifacts(audio_array, 'musicgen')
+        logger.warning(f"SpeechBrain's HiFi-GAN generation failed: {e}")
+        return add_vocoder_artifacts(audio_array, 'speechbrain_hifigan')
 
 def add_vocoder_artifacts(audio_array, vocoder_type):
     """Add synthetic artifacts to audio to simulate vocoder processing"""
     try:
+        # Ensure audio_array is numpy array
+        if isinstance(audio_array, torch.Tensor):
+            synthetic_audio = audio_array.detach().cpu().numpy()
+        else:
+            synthetic_audio = audio_array.copy()
+            
+        # Ensure it's 1D
+        if synthetic_audio.ndim > 1:
+            synthetic_audio = synthetic_audio.squeeze()
+            
         # Add various artifacts that different vocoders typically introduce
-        synthetic_audio = audio_array.copy()
-        
-        if vocoder_type == 'hifigan' or vocoder_type == 'speecht5_hifigan':
+        if vocoder_type == 'hifigan':
             # HiFi-GAN artifacts: slight high-frequency emphasis and phase distortion
-            # High-shelf filter
-            b, a = signal.butter(4, 8000, btype='high', fs=16000)
-            synthetic_audio = signal.filtfilt(b, a, synthetic_audio) * 0.15 + synthetic_audio * 0.85
-            # Add slight aliasing artifacts
-            synthetic_audio = np.clip(synthetic_audio * 1.05, -1.0, 1.0)
+            try:
+                nyquist = 16000 / 2
+                high_freq = min(7000, nyquist - 100)  # Ensure frequency is below Nyquist
+                b, a = signal.butter(4, high_freq / nyquist, btype='high')
+                high_emphasis = signal.filtfilt(b, a, synthetic_audio)
+                synthetic_audio = high_emphasis * 0.15 + synthetic_audio * 0.85
+                # Add slight aliasing artifacts
+                synthetic_audio = np.clip(synthetic_audio * 1.05, -1.0, 1.0)
+            except Exception as e:
+                logger.warning(f"Error adding HiFi-GAN artifacts: {e}")
             
-        elif vocoder_type == 'bark':
-            # Bark artifacts: compression, subtle noise, and prosodic changes
-            # Apply compression
-            synthetic_audio = np.tanh(synthetic_audio * 1.3) * 0.8
-            # Add very subtle noise with frequency coloring
-            noise = np.random.normal(0, 0.002, len(synthetic_audio))
-            # Color the noise (emphasize mid frequencies)
-            from scipy import signal
-            b, a = signal.butter(2, [1000, 4000], btype='band', fs=16000)
-            colored_noise = signal.filtfilt(b, a, noise)
-            synthetic_audio += colored_noise
-            
-        elif vocoder_type == 'vits':
-            # VITS artifacts: flow-based modeling artifacts, slight spectral smoothing
-            # Apply spectral smoothing through low-pass filtering
-            from scipy import signal
-            b, a = signal.butter(4, 7500, btype='low', fs=16000)
-            synthetic_audio = signal.filtfilt(b, a, synthetic_audio) * 0.9 + synthetic_audio * 0.1
-            # Add flow-based modeling artifacts (slight nonlinearity)
-            synthetic_audio = synthetic_audio + 0.02 * np.sin(synthetic_audio * 10)
-            
-        elif vocoder_type == 'musicgen':
-            # MusicGen artifacts: temporal inconsistencies and phase shifts
-            # Apply temporal phase shift
-            synthetic_audio = np.roll(synthetic_audio, 2) * 0.1 + synthetic_audio * 0.9
-            # Add slight temporal jitter
-            jitter = np.random.uniform(-0.05, 0.05, len(synthetic_audio))
-            synthetic_audio = synthetic_audio * (1 + jitter)
-            
-        elif vocoder_type == 'tortoise':
-            # Tortoise artifacts: over-smoothing and prosodic artifacts
-            # Apply heavy smoothing (Tortoise is known for this)
-            from scipy import signal
-            # Multiple stages of smoothing
-            b, a = signal.butter(3, 6000, btype='low', fs=16000)
-            synthetic_audio = signal.filtfilt(b, a, synthetic_audio)
-            # Add prosodic artifacts (slight pitch variations)
-            pitch_mod = 0.03 * np.sin(2 * np.pi * 2 * np.arange(len(synthetic_audio)) / 16000)
-            synthetic_audio = synthetic_audio * (1 + pitch_mod)
-            
-        elif vocoder_type == 'tacotron2':
+        elif vocoder_type == 'tacotron2_griffinlim':
             # Tacotron2 artifacts: attention artifacts and slight spectral distortion
-            # Add attention-based artifacts (periodic distortion)
-            attention_artifact = 0.02 * np.sin(2 * np.pi * 50 * np.arange(len(synthetic_audio)) / 16000)
-            synthetic_audio += attention_artifact
-            # Slight spectral tilt
-            from scipy import signal
-            b, a = signal.butter(2, 5000, btype='high', fs=16000)
-            high_freq = signal.filtfilt(b, a, synthetic_audio)
-            synthetic_audio = synthetic_audio + high_freq * 0.1
+            try:
+                # Add attention-based artifacts (periodic distortion)
+                attention_artifact = 0.02 * np.sin(2 * np.pi * 50 * np.arange(len(synthetic_audio)) / 16000)
+                synthetic_audio += attention_artifact
+                # Slight spectral tilt
+                nyquist = 16000 / 2
+                high_freq = min(5000, nyquist - 100)
+                b, a = signal.butter(2, high_freq / nyquist, btype='high')
+                high_freq_component = signal.filtfilt(b, a, synthetic_audio)
+                synthetic_audio = synthetic_audio + high_freq_component * 0.1
+            except Exception as e:
+                logger.warning(f"Error adding Tacotron2 artifacts: {e}")
+            
+        elif vocoder_type == 'worldvocoder':
+            # WorldVocoder artifacts: slight phase distortion and spectral smoothing
+            try:
+                nyquist = 16000 / 2
+                low_freq = min(7500, nyquist - 100)
+                b, a = signal.butter(4, low_freq / nyquist, btype='low')
+                smoothed = signal.filtfilt(b, a, synthetic_audio)
+                synthetic_audio = smoothed * 0.9 + synthetic_audio * 0.1
+                # Add slight phase distortion
+                synthetic_audio = synthetic_audio + 0.02 * np.sin(synthetic_audio * 10)
+            except Exception as e:
+                logger.warning(f"Error adding WorldVocoder artifacts: {e}")
+            
+        elif vocoder_type == 'vocos':
+            # Vocos artifacts: slight temporal jitter and spectral smoothing
+            try:
+                # Apply temporal jitter
+                jitter = np.random.uniform(-0.05, 0.05, len(synthetic_audio))
+                synthetic_audio = synthetic_audio * (1 + jitter)
+                # Apply spectral smoothing
+                nyquist = 16000 / 2
+                low_freq = min(6000, nyquist - 100)
+                b, a = signal.butter(3, low_freq / nyquist, btype='low')
+                synthetic_audio = signal.filtfilt(b, a, synthetic_audio)
+            except Exception as e:
+                logger.warning(f"Error adding Vocos artifacts: {e}")
+            
+        elif vocoder_type == 'speechbrain_hifigan':
+            # SpeechBrain HiFi-GAN artifacts: similar to HiFi-GAN but with more emphasis
+            try:
+                nyquist = 16000 / 2
+                high_freq = min(7000, nyquist - 100)
+                b, a = signal.butter(4, high_freq / nyquist, btype='high')
+                high_emphasis = signal.filtfilt(b, a, synthetic_audio)
+                synthetic_audio = high_emphasis * 0.2 + synthetic_audio * 0.8
+                # Add more pronounced aliasing artifacts
+                synthetic_audio = np.clip(synthetic_audio * 1.1, -1.0, 1.0)
+            except Exception as e:
+                logger.warning(f"Error adding SpeechBrain HiFi-GAN artifacts: {e}")
         
         # Ensure audio is in valid range
         synthetic_audio = np.clip(synthetic_audio, -1.0, 1.0)
@@ -758,7 +790,11 @@ def add_vocoder_artifacts(audio_array, vocoder_type):
         
     except Exception as e:
         logger.warning(f"Artifact addition failed for {vocoder_type}: {e}")
-        return audio_array
+        # Return original audio as fallback
+        if isinstance(audio_array, torch.Tensor):
+            return audio_array.detach().cpu().numpy().astype(np.float32)
+        else:
+            return audio_array.astype(np.float32)
 
 def train_model(model, train_loader, val_loader, num_epochs=50, learning_rate=1e-4):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -893,6 +929,7 @@ def main():
         num_classes=2,
         dropout=0.1
     )
+    print("CREATING CONFIG")
     
     # Data directories
     data_dir = "./audio_data"
@@ -904,16 +941,21 @@ def main():
     os.makedirs(synthetic_audio_dir, exist_ok=True)
     
     # Generate synthetic data using multiple vocoders
+    print("CREATING SYNTHETIC DATA")
+    login(token="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")
+
     create_synthetic_data(
         real_audio_dir, 
         synthetic_audio_dir, 
         dataset_name="common_voice",  # Options: "common_voice", "librispeech", "vctk"
         language="en", 
-        num_samples=2000  # Adjust based on your needs
+        num_samples=2000  
     )
+    print("SYNTHETIC DATA CREATED")
     
     # Create datasets
-    dataset = AudioDataset(data_dir, max_length=64000)
+    dataset = AudioDataset(data_dir, max_length=10000)
+    print("DATASET CREATED")
     
     # Split dataset
     train_size = int(0.8 * len(dataset))
@@ -926,11 +968,13 @@ def main():
     
     # Initialize model
     model = EnhancedRawNet2(config)
-    
+    print("MODEL INITIALIZED")
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
     
+    print("TRAINING MODEL")
     # Train model
     trained_model = train_model(model, train_loader, val_loader, num_epochs=50)
+    print("MODEL TRAINED")
     
     # Save to HuggingFace
     save_to_huggingface(trained_model, repo_name="your-username/enhanced-rawnet2-antispoofing")
