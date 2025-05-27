@@ -340,122 +340,15 @@ class AudioDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.long)
         }
 
-def create_synthetic_data(real_audio_dir, synthetic_audio_dir, dataset_name="common_voice", language="en", num_samples=1000):
-    """
-    Create synthetic data by loading real audio from HuggingFace datasets,
-    processing half through neural vocoders, and organizing into directories.
-    """
-    logger.info(f"Creating synthetic data from {dataset_name} dataset")
-    
-    # Create directories
-    os.makedirs(real_audio_dir, exist_ok=True)
-    os.makedirs(synthetic_audio_dir, exist_ok=True)
-    
-    try:
-        # Load dataset from HuggingFace
-        logger.info(f"Loading {dataset_name} dataset...")
-        if dataset_name == "common_voice":
-            dataset = load_dataset("mozilla-foundation/common_voice_13_0", language, split="train", streaming=True)
-            dataset = dataset.take(num_samples)
-        elif dataset_name == "librispeech":
-            dataset = load_dataset("librispeech_asr", "clean", split="train.100", streaming=True)
-            dataset = dataset.take(num_samples)
-        elif dataset_name == "vctk":
-            dataset = load_dataset("vctk", split="train", streaming=True)
-            dataset = dataset.take(num_samples)
-        else:
-            # Fallback to LibriSpeech
-            dataset = load_dataset("librispeech_asr", "clean", split="train.100", streaming=True)
-            dataset = dataset.take(num_samples)
-        
-        # Convert streaming dataset to list for easier manipulation
-        dataset_list = list(dataset)
-        logger.info(f"Loaded {len(dataset_list)} audio samples")
-        
-        # Split dataset in half
-        split_point = len(dataset_list) // 2
-        real_samples = dataset_list[:split_point]
-        synthetic_samples = dataset_list[split_point:]
-        
-        # Save real audio samples
-        logger.info("Saving real audio samples...")
-        for i, sample in enumerate(tqdm(real_samples, desc="Processing real audio")):
-            try:
-                # Extract audio data
-                if 'audio' in sample:
-                    audio_data = sample['audio']
-                    audio_array = audio_data['array']
-                    sample_rate = audio_data['sampling_rate']
-                else:
-                    continue
-                
-                # Ensure audio is 16kHz mono
-                if sample_rate != 16000:
-                    audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
-                    sample_rate = 16000
-                
-                # Save as WAV file
-                output_path = os.path.join(real_audio_dir, f"real_{i:05d}.wav")
-                sf.write(output_path, audio_array, sample_rate)
-                
-            except Exception as e:
-                logger.warning(f"Error processing real sample {i}: {e}")
-                continue
-        
-        # Initialize vocoders for synthetic audio generation
-        logger.info("Loading neural vocoders...")
-        vocoders = load_vocoders()
-        
-        # Generate synthetic audio samples
-        logger.info("Generating synthetic audio samples...")
-        for i, sample in enumerate(tqdm(synthetic_samples, desc="Generating synthetic audio")):
-            try:
-                # Extract audio data
-                if 'audio' in sample:
-                    audio_data = sample['audio']
-                    audio_array = audio_data['array']
-                    sample_rate = audio_data['sampling_rate']
-                else:
-                    continue
-                
-                # Ensure audio is 16kHz mono
-                if sample_rate != 16000:
-                    audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
-                    sample_rate = 16000
-                
-                # Randomly select a vocoder
-                vocoder_name = random.choice(list(vocoders.keys()))
-                vocoder_models = vocoders[vocoder_name]
-                
-                # Generate synthetic audio using the selected vocoder
-                synthetic_audio = generate_synthetic_audio(
-                    audio_array, sample_rate, vocoder_models, vocoder_name
-                )
-                
-                if synthetic_audio is not None:
-                    output_path = os.path.join(synthetic_audio_dir, f"synthetic_{vocoder_name}_{i:05d}.wav")
-                    sf.write(output_path, synthetic_audio, 16000)
-                
-            except Exception as e:
-                logger.warning(f"Error processing synthetic sample {i}: {e}")
-                continue
-        
-        logger.info(f"Data generation complete!")
-        logger.info(f"Real samples: {len(os.listdir(real_audio_dir))}")
-        logger.info(f"Synthetic samples: {len(os.listdir(synthetic_audio_dir))}")
-        
-    except Exception as e:
-        logger.error(f"Error in data generation: {e}")
-        raise
-
 def load_vocoders():
-    """Load five specific neural vocoders"""
+    """Load five specific neural vocoders with GPU support"""
     vocoders = {}
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     try:
         # 1. HiFi-GAN (from hifigan_vocoder)
         logger.info("Loading HiFi-GAN...")
-        hifigan_model = hifigan(dataset='uni', device='cpu')
+        hifigan_model = hifigan(dataset='uni', device=device)
         vocoders['hifigan'] = {
             'model': hifigan_model,
             'type': 'hifigan'
@@ -468,8 +361,8 @@ def load_vocoders():
         logger.info("Loading Tacotron2 with Griffin-Lim...")
         bundle = torchaudio.pipelines.TACOTRON2_WAVERNN_CHAR_LJSPEECH
         processor = bundle.get_text_processor()
-        tacotron2 = bundle.get_tacotron2()
-        vocoder = bundle.get_vocoder()
+        tacotron2 = bundle.get_tacotron2().to(device)
+        vocoder = bundle.get_vocoder().to(device)
         
         vocoders['tacotron2_griffinlim'] = {
             'model': vocoder,
@@ -494,7 +387,7 @@ def load_vocoders():
     try:
         # 4. Vocos
         logger.info("Loading Vocos...")
-        vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz")
+        vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
         vocoders['vocos'] = {
             'model': vocos,
             'type': 'vocos'
@@ -505,7 +398,7 @@ def load_vocoders():
     try:
         # 5. SpeechBrain's HiFi-GAN
         logger.info("Loading SpeechBrain's HiFi-GAN...")
-        hifi_gan = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-ljspeech")
+        hifi_gan = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-ljspeech").to(device)
         vocoders['speechbrain_hifigan'] = {
             'model': hifi_gan,
             'type': 'speechbrain_hifigan'
@@ -520,8 +413,119 @@ def load_vocoders():
     logger.info(f"Loaded {len(vocoders)} vocoders: {list(vocoders.keys())}")
     return vocoders
 
+def create_synthetic_data(real_audio_dir, synthetic_audio_dir, dataset_name="common_voice", language="en", num_samples=1000):
+    """
+    Create synthetic data by loading real audio from HuggingFace datasets,
+    processing half through neural vocoders, and organizing into directories.
+    """
+    logger.info(f"Creating synthetic data from {dataset_name} dataset")
+    
+    # Create directories
+    os.makedirs(real_audio_dir, exist_ok=True)
+    os.makedirs(synthetic_audio_dir, exist_ok=True)
+    
+    try:
+        # Load dataset from HuggingFace
+        logger.info(f"Loading {dataset_name} dataset...")
+        if dataset_name == "common_voice":
+            dataset = load_dataset("mozilla-foundation/common_voice_13_0", language, split="train", streaming=True)
+            dataset = dataset.take(num_samples)
+        elif dataset_name == "librispeech":
+            dataset = load_dataset("librispeech_asr", "clean", split="train.100", streaming=True)
+            dataset = dataset.take(num_samples)
+        elif dataset_name == "vctk":
+            dataset = load_dataset("vctk", split="train", streaming=True)
+            dataset = dataset.take(num_samples)
+        else:
+            dataset = load_dataset("librispeech_asr", "clean", split="train.100", streaming=True)
+            dataset = dataset.take(num_samples)
+        
+        # Convert streaming dataset to list for easier manipulation
+        dataset_list = list(dataset)
+        logger.info(f"Loaded {len(dataset_list)} audio samples")
+        
+        # Split dataset in half
+        split_point = len(dataset_list) // 2
+        real_samples = dataset_list[:split_point]
+        synthetic_samples = dataset_list[split_point:]
+        
+        # Save real audio samples
+        logger.info("Saving real audio samples...")
+        for i, sample in enumerate(tqdm(real_samples, desc="Processing real audio")):
+            try:
+                if 'audio' in sample:
+                    audio_data = sample['audio']
+                    audio_array = audio_data['array']
+                    sample_rate = audio_data['sampling_rate']
+                    
+                    if sample_rate != 16000:
+                        audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+                        sample_rate = 16000
+                    
+                    output_path = os.path.join(real_audio_dir, f"real_{i:05d}.wav")
+                    sf.write(output_path, audio_array, sample_rate)
+            except Exception as e:
+                logger.warning(f"Error processing real sample {i}: {e}")
+                continue
+        
+        # Initialize vocoders for synthetic audio generation
+        logger.info("Loading neural vocoders...")
+        vocoders = load_vocoders()
+        
+        # Generate synthetic audio samples in batches
+        logger.info("Generating synthetic audio samples...")
+        batch_size = 8  # Adjust based on your GPU memory
+        num_batches = (len(synthetic_samples) + batch_size - 1) // batch_size
+        
+        for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(synthetic_samples))
+            batch_samples = synthetic_samples[start_idx:end_idx]
+            
+            # Process each sample in the batch
+            for i, sample in enumerate(batch_samples):
+                try:
+                    if 'audio' in sample:
+                        audio_data = sample['audio']
+                        audio_array = audio_data['array']
+                        sample_rate = audio_data['sampling_rate']
+                        
+                        if sample_rate != 16000:
+                            audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+                            sample_rate = 16000
+                        
+                        # Randomly select a vocoder
+                        vocoder_name = random.choice(list(vocoders.keys()))
+                        vocoder_models = vocoders[vocoder_name]
+                        
+                        # Generate synthetic audio using the selected vocoder
+                        synthetic_audio = generate_synthetic_audio(
+                            audio_array, sample_rate, vocoder_models, vocoder_name
+                        )
+                        
+                        if synthetic_audio is not None:
+                            output_path = os.path.join(synthetic_audio_dir, f"synthetic_{vocoder_name}_{start_idx + i:05d}.wav")
+                            sf.write(output_path, synthetic_audio, 16000)
+                            
+                except Exception as e:
+                    logger.warning(f"Error processing synthetic sample {start_idx + i}: {e}")
+                    continue
+            
+            # Clear GPU memory after each batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        logger.info(f"Data generation complete!")
+        logger.info(f"Real samples: {len(os.listdir(real_audio_dir))}")
+        logger.info(f"Synthetic samples: {len(os.listdir(synthetic_audio_dir))}")
+        
+    except Exception as e:
+        logger.error(f"Error in data generation: {e}")
+        raise
+
 def generate_synthetic_audio(audio_array, sample_rate, vocoder_models, vocoder_name):
-    """Generate synthetic audio using the specified vocoder"""
+    """Generate synthetic audio using the specified vocoder with GPU support"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     try:
         if vocoder_name == 'hifigan':
@@ -541,21 +545,30 @@ def generate_synthetic_audio(audio_array, sample_rate, vocoder_models, vocoder_n
     except Exception as e:
         logger.warning(f"Error generating with {vocoder_name}: {e}")
         return add_vocoder_artifacts(audio_array, vocoder_name)
+    finally:
+        # Clear GPU memory after each generation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def audio_to_mel(audio_array, sample_rate, n_mels=80, n_fft=1024, hop_length=256):
     """
     Convert a numpy audio array to a mel-spectrogram tensor.
     """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # Ensure audio is a torch tensor, shape (1, N)
     if not isinstance(audio_array, torch.Tensor):
-        audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+        audio_tensor = torch.tensor(audio_array, dtype=torch.float32, device=device)
     else:
-        audio_tensor = audio_array.float()
+        audio_tensor = audio_array.float().to(device)
+    
     if audio_tensor.ndim == 1:
         audio_tensor = audio_tensor.unsqueeze(0)
+    
     # Normalize if needed
     if audio_tensor.abs().max() > 1.0:
         audio_tensor = audio_tensor / audio_tensor.abs().max()
+        
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=sample_rate,
         n_fft=n_fft,
@@ -565,7 +578,8 @@ def audio_to_mel(audio_array, sample_rate, n_mels=80, n_fft=1024, hop_length=256
         power=1.0,
         norm="slaney",
         mel_scale="htk"
-    )
+    ).to(device)
+    
     mel = mel_transform(audio_tensor)
     # (1, n_mels, T)
     return mel
@@ -578,10 +592,20 @@ def generate_with_hifigan(audio_array, sample_rate, models):
             audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
         else:
             audio_tensor = audio_array.float()
+        
+        # Ensure tensor is on the same device as the model
+        device = "cuda"
+        audio_tensor = audio_tensor.to(device)
             
         mel = audio_to_mel(audio_tensor, sample_rate)  # (1, 80, T)
+        
+        # Make sure mel spectrogram is on correct device
+        if isinstance(mel, torch.Tensor):
+            mel = mel.to(device)
+        
         with torch.no_grad():
             audio = model.infer(mel)
+            # Always move to CPU before converting to numpy
             if isinstance(audio, torch.Tensor):
                 audio = audio.squeeze().detach().cpu().numpy()
             else:
@@ -590,6 +614,7 @@ def generate_with_hifigan(audio_array, sample_rate, models):
     except Exception as e:
         logger.warning(f"HiFi-GAN generation failed: {e}")
         return add_vocoder_artifacts(audio_array, 'hifigan')
+
 def generate_with_tacotron2_griffinlim(audio_array, sample_rate, models):
     """Generate synthetic audio using Tacotron2 with Griffin-Lim"""
     try:
